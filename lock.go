@@ -23,6 +23,10 @@ var (
 	refreshLua string
 
 	ErrFailedToPreemptLock = errors.New("lock: Failed Lock Grab")
+	// ErrLockNotHold typically occurs when you expect that you are supposed to hold the lock, but you don't
+	// For example, you might get this error when you try to release a lock.
+	// This generally means that someone has bypassed rlock's controls and manipulated Redis directly.
+	ErrLockNotHold = errors.New("rlock: did not hold lock")
 )
 
 type Client struct {
@@ -107,6 +111,7 @@ type Lock struct {
 	key        string
 	value      string
 	expiration time.Duration
+	unlock     chan struct{}
 	unLockOnce sync.Once
 }
 
@@ -116,20 +121,86 @@ func newLock(client redis.Cmdable, key string, value string, expiration time.Dur
 		key:        key,
 		value:      value,
 		expiration: expiration,
+		unlock:     make(chan struct{}, 1),
 	}
 }
 
 func (l *Lock) Refresh(ctx context.Context) error {
-	// TODO
-	panic("")
+	res, err := l.client.Eval(ctx, refreshLua, []string{l.key}, l.value, l.expiration.Seconds()).Int64()
+	if err != nil {
+		return err
+	}
+	if res != 1 {
+		return ErrLockNotHold
+	}
+	return nil
 }
 
-func (l *Lock) AutoRefresh(ctx context.Context) error {
-	// TODO
-	panic("")
+func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error {
+	ticker := time.NewTicker(interval)
+	ch := make(chan struct{}, 1)
+	defer func() {
+		ticker.Stop()
+		close(ch)
+	}()
+	for {
+		select {
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := l.Refresh(ctx)
+			cancel()
+			// timeout here to keep trying
+			if errors.Is(err, context.DeadlineExceeded) {
+				// Because there are two possible places to write data, and ch capacity is only one,
+				// so if it doesn't go in it means the previous call timed out and hasn't been processed yet.
+				// At the same time, the timer is triggered.
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		case <-ch:
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := l.Refresh(ctx)
+			cancel()
+			// timeout here to keep trying
+			if errors.Is(err, context.DeadlineExceeded) {
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		case <-l.unlock:
+			return nil
+		}
+	}
 }
 
 func (l *Lock) Unlock(ctx context.Context) error {
-	// TODO
-	panic("")
+	res, err := l.client.Eval(ctx, unlockLua, []string{l.key}, l.value).Int64()
+	defer func() {
+		// avoiding repeated unlocking to cause a panic
+		l.unLockOnce.Do(func() {
+			l.unlock <- struct{}{}
+			close(l.unlock)
+		})
+	}()
+	if errors.Is(err, redis.Nil) {
+		return ErrLockNotHold
+	}
+	if err != nil {
+		return err
+	}
+	if res != 1 {
+		return ErrLockNotHold
+	}
+	return nil
 }
