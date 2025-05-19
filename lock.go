@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"golang.org/x/sync/singleflight"
 	"sync"
 	"time"
 
@@ -31,6 +32,7 @@ var (
 
 type Client struct {
 	client redis.Cmdable
+	g      singleflight.Group
 	valuer func() string
 }
 
@@ -43,6 +45,28 @@ func NewClient(client redis.Cmdable) *Client {
 
 func (c *Client) SetValuer(valuer func() string) {
 	c.valuer = valuer
+}
+
+func (c *Client) SingleflightLock(ctx context.Context, key string, expiration time.Duration, timeout time.Duration, retry RetryStrategy) (*Lock, error) {
+	for {
+		flag := false
+		res := c.g.DoChan(key, func() (interface{}, error) {
+			flag = true
+			return c.Lock(ctx, key, expiration, timeout, retry)
+		})
+		select {
+		case result := <-res:
+			if flag {
+				c.g.Forget(key)
+				if result.Err != nil {
+					return nil, result.Err
+				}
+				return result.Val.(*Lock), nil
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 func (c *Client) Lock(ctx context.Context, key string, expiration time.Duration, timeout time.Duration, retry RetryStrategy) (*Lock, error) {

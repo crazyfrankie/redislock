@@ -383,3 +383,23 @@ func TestLock_Refresh(t *testing.T) {
 		})
 	}
 }
+
+func TestClient_SingleflightLock(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	rdb := mocks.NewMockCmdable(ctrl)
+	cmd := redis.NewBoolCmd(context.Background())
+	cmd.SetVal(true)
+	rdb.EXPECT().SetNX(gomock.Any(), "locked-key", gomock.Any(), time.Minute).
+		Return(cmd)
+	client := NewClient(rdb)
+	// TODO concurrency test
+	_, err := client.SingleflightLock(context.Background(),
+		"locked-key",
+		time.Minute,
+		time.Second, &FixIntervalRetry{
+			Interval: time.Millisecond,
+			Max:      3,
+		})
+	require.NoError(t, err)
+}
